@@ -14,7 +14,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
@@ -381,9 +381,100 @@ fn a_nested_entry_mirrors_relative_to_the_tileset_folder() {
     );
 }
 
+/// A body cut short mid-transfer is a transient failure: the retry must recover
+/// the full body, and the second attempt must replace — not append to — the
+/// partial bytes the first attempt already wrote.
+#[test]
+fn a_body_cut_short_midway_is_retried_without_appending_to_the_partial_write() {
+    const PATH: &str = "/tiles/0.b3dm";
+    let body = b"a-complete-tile-payload-delivered-across-two-attempts".to_vec();
+    let server = TestServer::start_truncating(PATH, &body, 1);
+    let output = TempDir::new().expect("temp dir");
+
+    let fetcher = Fetcher::new(&ClientConfig::default()).expect("client");
+    let url = Url::parse(&server.url(PATH)).expect("url");
+
+    let written = fetcher
+        .get_to_file(&url, &output.path().join("0.b3dm"))
+        .expect("the retry must recover the full body");
+
+    assert_eq!(written, body.len() as u64);
+    // Equality with the exact body is what proves the second attempt truncated:
+    // had it appended to the partial first write, the file would be longer.
+    assert_eq!(fs::read(output.path().join("0.b3dm")).expect("read"), body);
+}
+
+/// A body that never completes is reported as a failure after the retries are
+/// exhausted, and the failed attempt must leave no `.part` behind.
+///
+/// The route table is the full existing fixture, so this also proves that one
+/// permanently broken tile does not discard the rest of the mirror.
+#[test]
+fn a_body_that_never_completes_fails_and_leaves_no_part_file() {
+    let server = TestServer::start_with(routes(None), Some(("/tiles/0.b3dm", 99)));
+    let output = TempDir::new().expect("temp dir");
+
+    // One retry keeps the test fast while still exhausting the budget: the
+    // second attempt fails and the file is reported, after a single backoff.
+    let fetcher = Fetcher::new(&ClientConfig {
+        retries: 1,
+        ..ClientConfig::default()
+    })
+    .expect("client");
+    let entry = path_util::normalize_entry_url(&server.url("/tileset.json")).expect("entry URL");
+
+    let discovery = discover_with(
+        &fetcher,
+        &entry,
+        &DiscoveryOptions { progress: false },
+        None,
+    )
+    .expect("discovery");
+
+    let summary = download_all_with(
+        &fetcher,
+        &discovery.items,
+        output.path(),
+        &DownloadOptions {
+            overwrite: false,
+            progress: false,
+        },
+        None,
+    )
+    .expect("download");
+
+    assert!(!summary.is_success());
+    assert_eq!(summary.failures.len(), 1);
+    assert_eq!(summary.downloaded, discovery.len() - 1);
+    assert!(summary.failures[0].url.ends_with("/tiles/0.b3dm"));
+
+    // One bad tile must not discard the rest: the entry document still landed.
+    assert!(output.path().join("tileset.json").exists());
+    // The failed attempt's `.part` was cleaned up rather than left truncated.
+    assert!(
+        !has_extension(output.path(), "part"),
+        "a .part file survived the failed run"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // A minimal HTTP/1.1 server: enough to answer one GET per connection.
 // ---------------------------------------------------------------------------
+
+/// The route table, plus the state a cut-short route needs.
+struct Routes {
+    bodies: HashMap<String, Vec<u8>>,
+    /// A path whose body is deliberately cut one byte short for its first
+    /// `times` requests, so the mid-body retry path can be exercised.
+    truncate: Option<Truncate>,
+    /// How many requests for `truncate.path` have been served so far.
+    requests: AtomicUsize,
+}
+
+struct Truncate {
+    path: String,
+    times: usize,
+}
 
 struct TestServer {
     addr: SocketAddr,
@@ -393,6 +484,31 @@ struct TestServer {
 
 impl TestServer {
     fn start(routes: HashMap<String, Vec<u8>>) -> Self {
+        Self::start_with(routes, None)
+    }
+
+    /// Serve `path`'s body cut one byte short on its first `times` requests.
+    fn start_truncating(path: &str, body: &[u8], times: usize) -> Self {
+        let mut routes = HashMap::new();
+        routes.insert(path.to_owned(), body.to_vec());
+        Self::start_with(routes, Some((path, times)))
+    }
+
+    /// Serve `routes`, cutting `truncate`'s path short for the given number of
+    /// requests. Every constructor funnels through here so the listener and
+    /// thread setup lives in exactly one place.
+    fn start_with(routes: HashMap<String, Vec<u8>>, truncate: Option<(&str, usize)>) -> Self {
+        Self::spawn(Routes {
+            bodies: routes,
+            truncate: truncate.map(|(path, times)| Truncate {
+                path: path.to_owned(),
+                times,
+            }),
+            requests: AtomicUsize::new(0),
+        })
+    }
+
+    fn spawn(routes: Routes) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
         let addr = listener.local_addr().expect("local addr");
         let running = Arc::new(AtomicBool::new(true));
@@ -434,12 +550,21 @@ impl Drop for TestServer {
     }
 }
 
-fn serve(mut stream: TcpStream, routes: &HashMap<String, Vec<u8>>) {
+fn serve(mut stream: TcpStream, routes: &Routes) {
     let Some(path) = read_request_path(&mut stream) else {
         return;
     };
 
-    let body = routes.get(&path);
+    // Only requests for the truncating route consume its budget, so unrelated
+    // requests served alongside it do not shorten the cut-short window.
+    let cut_short = match &routes.truncate {
+        Some(truncate) if truncate.path == path => {
+            routes.requests.fetch_add(1, Ordering::SeqCst) < truncate.times
+        }
+        _ => false,
+    };
+
+    let body = routes.bodies.get(&path);
     let header = match body {
         Some(body) => format!(
             "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/octet-stream\r\nConnection: close\r\n\r\n",
@@ -449,8 +574,16 @@ fn serve(mut stream: TcpStream, routes: &HashMap<String, Vec<u8>>) {
     };
 
     let _ = stream.write_all(header.as_bytes());
-    if let Some(body) = body {
-        let _ = stream.write_all(body);
+    match body {
+        Some(body) if cut_short => {
+            // Declare the full length but deliver one byte less, then close, so
+            // the client observes an incomplete body: a mid-body failure.
+            let _ = stream.write_all(&body[..body.len().saturating_sub(1)]);
+        }
+        Some(body) => {
+            let _ = stream.write_all(body);
+        }
+        None => {}
     }
     let _ = stream.flush();
 }

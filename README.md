@@ -223,7 +223,7 @@ Discovery is **fail-fast**: a broken external tileset or an undecodable subtree 
 
 **2. Download** (`src/download.rs`)
 
-- Every item is fetched through a shared `reqwest` blocking client inside a `rayon` pool, then written to `<name>.part` and atomically renamed.
+- Every item is fetched through a shared `reqwest` blocking client inside a `rayon` pool, then streamed chunk by chunk into `<name>.part` — so memory does not scale with tile size — and atomically renamed.
 - Failures are collected, not propagated: the run finishes, reports every failure, and exits non-zero.
 
 Supporting modules: `src/tileset.rs` (the `tileset.json` model and tile walk), `src/implicit.rs` (subtree decoding, Morton order, availability bits), `src/net.rs` (client + retry policy), `src/path_util.rs` (URL → safe local path), `src/error.rs` (typed errors).

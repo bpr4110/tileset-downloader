@@ -6,6 +6,9 @@
 //! and is `Send + Sync`, so a single instance is shared by reference across
 //! every worker thread instead of each thread paying for its own TLS setup.
 
+use std::fs::File;
+use std::io::{self, Write};
+use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use reqwest::blocking::Client;
@@ -72,10 +75,28 @@ impl Fetcher {
 
     /// Fetch a URL, retrying transient failures with exponential backoff.
     pub fn get_bytes(&self, url: &Url) -> Result<Vec<u8>> {
+        self.with_retry(url, || self.try_get(url))
+    }
+
+    /// Stream a URL straight into `path`, retrying transient failures.
+    ///
+    /// Unlike [`Fetcher::get_bytes`], the body is never held in memory: it is
+    /// copied to the file in chunks, so peak memory per download is one copy
+    /// buffer whatever the tile's size. `path` is truncated before every attempt,
+    /// so a retry after a mid-body failure starts over rather than appending to a
+    /// partial file. Returns the number of bytes written.
+    ///
+    /// The parent directory must already exist.
+    pub fn get_to_file(&self, url: &Url, path: &Path) -> Result<u64> {
+        self.with_retry(url, || self.try_get_to_file(url, path))
+    }
+
+    /// Run `op`, retrying transient failures with exponential backoff.
+    fn with_retry<T>(&self, url: &Url, mut op: impl FnMut() -> Result<T>) -> Result<T> {
         let mut attempt = 0u32;
         loop {
-            match self.try_get(url) {
-                Ok(bytes) => return Ok(bytes),
+            match op() {
+                Ok(value) => return Ok(value),
                 Err(err) if attempt < self.retries && is_transient(&err) => {
                     let delay = backoff(attempt);
                     tracing::warn!(
@@ -91,6 +112,51 @@ impl Fetcher {
                 }
                 Err(err) => return Err(err),
             }
+        }
+    }
+
+    fn try_get_to_file(&self, url: &Url, path: &Path) -> Result<u64> {
+        let mut response =
+            self.client
+                .get(url.clone())
+                .send()
+                .map_err(|source| Error::Request {
+                    url: url.to_string(),
+                    source,
+                })?;
+
+        let status = response.status();
+        if !status.is_success() {
+            return Err(Error::HttpStatus {
+                url: url.to_string(),
+                status: status.as_u16(),
+            });
+        }
+
+        // Truncating create: a retry replaces the previous attempt rather than
+        // appending to it.
+        let file = File::create(path).map_err(|source| Error::io("create", path, source))?;
+        let mut writer = RecordingWriter::new(file);
+
+        match response.copy_to(&mut writer) {
+            Ok(bytes) => {
+                writer
+                    .flush()
+                    .map_err(|source| Error::io("flush", path, source))?;
+                Ok(bytes)
+            }
+            // A failure on the write side is local — a full disk, a revoked
+            // permission. Retrying it cannot help, and the OS diagnostic is the
+            // actionable one, so it becomes an `Io` error rather than a request
+            // error that `is_transient` would retry.
+            Err(_) if writer.error.is_some() => {
+                let error = writer.error.take().expect("checked by the guard");
+                Err(Error::io("write", path, error))
+            }
+            Err(source) => Err(Error::Request {
+                url: url.to_string(),
+                source,
+            }),
         }
     }
 
@@ -119,6 +185,42 @@ impl Fetcher {
                 url: url.to_string(),
                 source,
             })
+    }
+}
+
+/// A `Write` wrapper that remembers the first write error.
+///
+/// [`reqwest::blocking::Response::copy_to`] reports read-side (network) and
+/// write-side (disk) failures as the same `reqwest::Error`. reqwest returns its
+/// own network errors unchanged, but a disk failure arrives as a generic
+/// decoding error — indistinguishable, afterwards, from a corrupt body, and
+/// therefore wrongly retried. Catching it here keeps it a local [`Error::Io`].
+struct RecordingWriter<W: Write> {
+    inner: W,
+    error: Option<io::Error>,
+}
+
+impl<W: Write> RecordingWriter<W> {
+    fn new(inner: W) -> Self {
+        Self { inner, error: None }
+    }
+}
+
+impl<W: Write> Write for RecordingWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self.inner.write(buf) {
+            Ok(written) => Ok(written),
+            Err(err) => {
+                self.error = Some(err);
+                // A placeholder: `copy_to` only needs to know the copy stopped.
+                // The real error is handed back by `try_get_to_file`.
+                Err(io::Error::other("disk write failed"))
+            }
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
     }
 }
 
@@ -260,5 +362,44 @@ mod tests {
         let second = backoff(1).as_millis();
         assert!(second > first, "backoff should grow");
         assert!(backoff(30).as_millis() <= 8_000 + 250, "backoff should cap");
+    }
+
+    #[test]
+    fn recording_writer_passes_bytes_through() {
+        let mut writer = RecordingWriter::new(Vec::new());
+        writer.write_all(b"tile bytes").expect("write succeeds");
+        writer.flush().expect("flush succeeds");
+        assert_eq!(writer.inner, b"tile bytes");
+        assert!(writer.error.is_none(), "a clean write records no error");
+    }
+
+    #[test]
+    fn recording_writer_remembers_a_disk_failure() {
+        let mut writer = RecordingWriter::new(FailingWriter);
+        assert!(
+            writer.write(b"anything").is_err(),
+            "the placeholder must stop the copy"
+        );
+
+        let error = writer.error.take().expect("the real error is kept");
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(error.to_string(), "no space left on device");
+    }
+
+    /// A `Write` that always fails, so the disk-failure path can be exercised
+    /// without touching a filesystem.
+    struct FailingWriter;
+
+    impl Write for FailingWriter {
+        fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "no space left on device",
+            ))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
     }
 }

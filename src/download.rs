@@ -171,7 +171,8 @@ pub fn download_all_with(
     Ok(summary)
 }
 
-/// Fetch one item and put it on disk, atomically.
+/// Fetch one item, streaming its body straight onto disk, then commit it
+/// atomically.
 fn fetch_one(
     fetcher: &Fetcher,
     item: &DownloadItem,
@@ -184,32 +185,38 @@ fn fetch_one(
         return Ok(FileOutcome::Skipped);
     }
 
-    let body = fetcher.get_bytes(&item.url)?;
-    write_atomic(&target, &body)?;
-    Ok(FileOutcome::Downloaded {
-        bytes: body.len() as u64,
-    })
-}
-
-/// Write `body` to `target` via a `.part` sibling.
-///
-/// The rename is the commit point: readers either see the old file or the
-/// complete new one, never a half-written tile. `fs::rename` will not overwrite
-/// on Windows, so an existing file is removed first.
-fn write_atomic(target: &Path, body: &[u8]) -> Result<()> {
     let parent = target.parent().ok_or_else(|| Error::UnsafeUri {
         uri: target.display().to_string(),
     })?;
     fs::create_dir_all(parent).map_err(|source| Error::io("create directory", parent, source))?;
 
-    let temp = temp_path(target);
-    fs::write(&temp, body).map_err(|source| Error::io("write", &temp, source))?;
+    // The body streams straight into the `.part` sibling, so no more than one
+    // copy buffer per in-flight file is ever held in memory.
+    let temp = temp_path(&target);
+    let bytes = match fetcher.get_to_file(&item.url, &temp) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            // A failed attempt must not leave a truncated `.part` behind.
+            let _ = fs::remove_file(&temp);
+            return Err(error);
+        }
+    };
 
+    commit(&temp, &target)?;
+    Ok(FileOutcome::Downloaded { bytes })
+}
+
+/// Rename `temp` over `target`: the commit point of a download.
+///
+/// Readers either see the old file or the complete new one, never a
+/// half-written tile. `fs::rename` will not overwrite on Windows, so an
+/// existing file is removed first.
+fn commit(temp: &Path, target: &Path) -> Result<()> {
     if target.exists() {
         fs::remove_file(target).map_err(|source| Error::io("replace", target, source))?;
     }
-    if let Err(source) = fs::rename(&temp, target) {
-        let _ = fs::remove_file(&temp);
+    if let Err(source) = fs::rename(temp, target) {
+        let _ = fs::remove_file(temp);
         return Err(Error::io("rename into place", target, source));
     }
 
