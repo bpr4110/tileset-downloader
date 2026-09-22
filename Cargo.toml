@@ -1,0 +1,44 @@
+[package]
+name = "tileset-downloader"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "Mirror a complete 3D Tiles tileset (tileset.json plus every tile it references) from a URL to a local directory."
+license = "MIT"
+readme = "README.md"
+keywords = ["3d-tiles", "cesium", "tileset", "downloader", "b3dm"]
+categories = ["command-line-utilities", "web-programming::http-client"]
+
+[lib]
+name = "tileset_downloader"
+path = "src/lib.rs"
+
+[[bin]]
+name = "tileset-downloader"
+path = "src/main.rs"
+
+[dependencies]
+base64 = "0.22"
+clap = { version = "4.5", features = ["derive"] }
+indicatif = "0.17"
+rayon = "1.10"
+reqwest = { version = "0.12", default-features = false, features = [
+    "blocking",
+    "rustls-tls",
+    "gzip",
+    "brotli",
+    "deflate",
+] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+url = "2.5"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

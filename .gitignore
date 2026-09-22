@@ -1,0 +1,28 @@
+# Rust build artifacts
+/target/
+**/*.rs.bk
+*.pdb
+
+# Local playground for downloads produced while testing
+/out/
+/tmp/
+
+# Partial downloads (the tool only renames a ".part" file once it is complete,
+# so these are always safe to delete)
+**/*.part
+
+# Editors and IDEs
+.vscode/
+.idea/
+*.iml
+*.swp
+*~
+
+# Operating system noise
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Local code-index / agent tooling state
+.codegraph/
+.omo/
